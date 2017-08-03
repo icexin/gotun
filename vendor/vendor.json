@@ -1,0 +1,31 @@
+{
+	"comment": "",
+	"ignore": "test",
+	"package": [
+		{
+			"checksumSHA1": "8R+CXppdizJ1Pt+FpoL79hMQJWA=",
+			"path": "github.com/coreos/go-iptables/iptables",
+			"revision": "f2ede9c85e2fac4d72d5a9af0af59c0858d7a3bd",
+			"revisionTime": "2017-07-26T17:52:05Z"
+		},
+		{
+			"checksumSHA1": "8FxjzTQlJ9MRrGdAxivRvXhijTU=",
+			"path": "github.com/songgao/water",
+			"revision": "99d07fc117afd4d997bc5ebca77c241644ffe24a",
+			"revisionTime": "2017-05-24T16:52:02Z"
+		},
+		{
+			"checksumSHA1": "Pki0iA65Dtsjh4gtabPkp/lOa2I=",
+			"path": "golang.org/x/sys/windows",
+			"revision": "0f826bdd13b500be0f1d4004938ad978fcc6031e",
+			"revisionTime": "2017-07-27T15:10:50Z"
+		},
+		{
+			"checksumSHA1": "ZdFZFaXmCgEEaEhVPkyXrnhKhsg=",
+			"path": "golang.org/x/sys/windows/registry",
+			"revision": "0f826bdd13b500be0f1d4004938ad978fcc6031e",
+			"revisionTime": "2017-07-27T15:10:50Z"
+		}
+	],
+	"rootPath": "github.com/icexin/gotun"
+}
