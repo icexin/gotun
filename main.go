@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync/atomic"
 
+	"github.com/coreos/go-iptables/iptables"
 	"github.com/songgao/water"
 )
 
@@ -18,6 +19,15 @@ var (
 	addr     = flag.String("addr", ":8000", "remote/listen address")
 	asserver = flag.Bool("s", false, "run as server")
 )
+
+func system(s string) error {
+	out, err := exec.Command("bash", "-c", s).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s:%s", err, out)
+	}
+
+	return nil
+}
 
 func ifconfig(iface string) error {
 	var cmd string
@@ -29,13 +39,7 @@ func ifconfig(iface string) error {
 	}
 
 	log.Print(cmd)
-	out, err := exec.Command("bash", "-c", cmd).CombinedOutput()
-	if err != nil {
-		log.Print(string(out))
-		return err
-	}
-
-	return nil
+	return system(cmd)
 }
 
 func setupIface() (*water.Interface, error) {
@@ -56,7 +60,46 @@ func setupIface() (*water.Interface, error) {
 	return iface, nil
 }
 
-func setupClientIptables() error {
+func setupIptables(ifaceName string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+
+	err := system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+	if err != nil {
+		return err
+	}
+
+	t, err := iptables.New()
+	if err != nil {
+		return err
+	}
+
+	t.NewChain("nat", "GOTUN-NAT")
+	t.NewChain("nat", "GOTUN-MARK")
+
+	t.ClearChain("nat", "GOTUN-NAT")
+	t.ClearChain("nat", "GOTUN-MARK")
+
+	// mark packets from iface
+	err = t.AppendUnique("nat", "GOTUN-MARK", "-i", ifaceName, "-j", "MARK", "--set-mark", "12321")
+	if err != nil {
+		return err
+	}
+
+	err = t.AppendUnique("nat", "GOTUN-NAT", "-m", "mark", "--mark", "12321", "!", "-d", *localip, "-j", "MASQUERADE")
+	if err != nil {
+		return err
+	}
+
+	err = t.AppendUnique("nat", "PREROUTING", "-j", "GOTUN-MARK")
+	if err != nil {
+		return err
+	}
+	err = t.AppendUnique("nat", "POSTROUTING", "-j", "GOTUN-NAT")
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -156,6 +199,10 @@ func main() {
 	}
 
 	if *asserver {
+		err = setupIptables(iface.Name())
+		if err != nil {
+			log.Fatal(err)
+		}
 		runserver(iface)
 	} else {
 		runclient(iface)
