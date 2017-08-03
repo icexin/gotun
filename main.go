@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync/atomic"
@@ -18,6 +20,7 @@ var (
 	peerip   = flag.String("p", "10.0.0.2", "peer ip")
 	addr     = flag.String("addr", ":8000", "remote/listen address")
 	asserver = flag.Bool("s", false, "run as server")
+	iplist   = flag.String("iplist", "", "a file contains ip list to forward")
 )
 
 func system(s string) error {
@@ -99,6 +102,38 @@ func setupIptables(ifaceName string) error {
 	err = t.AppendUnique("nat", "POSTROUTING", "-j", "GOTUN-NAT")
 	if err != nil {
 		return err
+	}
+	return nil
+}
+
+func addRoute(ip, iface string) error {
+	var cmd string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = fmt.Sprintf("route add -net %s -interface %s", ip, iface)
+	}
+
+	return system(cmd)
+
+}
+
+func setupRoute(ifaceName string) error {
+	if *iplist == "" {
+		return nil
+	}
+	f, err := os.Open(*iplist)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := bufio.NewScanner(f)
+	for r.Scan() {
+		ip := r.Text()
+		err = addRoute(ip, ifaceName)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -205,6 +240,10 @@ func main() {
 		}
 		runserver(iface)
 	} else {
+		err = setupRoute(iface.Name())
+		if err != nil {
+			log.Fatal(err)
+		}
 		runclient(iface)
 	}
 }
