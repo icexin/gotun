@@ -1,16 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"os/exec"
 	"runtime"
-	"time"
+	"sync/atomic"
 
 	"github.com/songgao/water"
 )
@@ -60,75 +57,92 @@ func setupIface() (*water.Interface, error) {
 }
 
 func setupClientIptables() error {
-
+	return nil
 }
+
 func runserver(iface *water.Interface) {
-	l, err := net.Listen("tcp", *addr)
+	listenaddr, err := net.ResolveUDPAddr("udp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-		handleConn(conn, iface)
-		log.Printf("connection from %s closed", conn.RemoteAddr())
+	conn, err := net.ListenUDP("udp", listenaddr)
+	if err != nil {
+		log.Fatal(err)
 	}
+	handleConn(conn, iface, nil)
 }
 
 func runclient(iface *water.Interface) {
+	remoteaddr, err := net.ResolveUDPAddr("udp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp", nil, remoteaddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	handleConn(conn, iface, remoteaddr)
+}
+
+func handleConn(conn *net.UDPConn, iface *water.Interface, remoteaddr net.Addr) {
+	var isclient bool
+	var remote atomic.Value
+	if remoteaddr != nil {
+		isclient = true
+	} else {
+		remoteaddr = &net.UDPAddr{}
+	}
+	remote.Store(remoteaddr)
+
+	go loopReadIface(iface, conn, &remote, isclient)
+
+	buf := make([]byte, 1600)
 	for {
-		conn, err := net.Dial("tcp", *addr)
+		n, addr, err := conn.ReadFrom(buf)
 		if err != nil {
 			log.Print(err)
-			goto sleep
+			continue
 		}
+		log.Printf("conn read %d", n)
 
-		handleConn(conn, iface)
-	sleep:
-		time.Sleep(time.Second)
+		if addr.String() != remoteaddr.String() {
+			log.Printf("remote changed %s -> %s", remoteaddr, addr)
+			remoteaddr = addr
+			remote.Store(addr)
+		}
+		_, err = iface.Write(buf[:n])
+		if err != nil {
+			log.Panic(err)
+		}
 	}
 }
 
-func handleConn(conn net.Conn, iface *water.Interface) {
-	r := bufio.NewReader(conn)
-	w := bufio.NewWriter(conn)
-	go func() {
-		defer conn.Close()
-		buf := make([]byte, 10240)
-		for {
-			var hdrlen int16
-			err := binary.Read(r, binary.BigEndian, &hdrlen)
-			if err != nil {
-				return
-			}
-			if int(hdrlen) > len(buf) {
-				log.Printf("bad hdrlen %d", hdrlen)
-				return
-			}
-			_, err = io.ReadFull(r, buf[:hdrlen])
-			if err != nil {
-				return
-			}
-			// log.Printf("read conn %d", hdrlen)
-			iface.Write(buf[:hdrlen])
-		}
-	}()
-	defer conn.Close()
-	buf := make([]byte, 10240)
+func loopReadIface(iface *water.Interface, conn *net.UDPConn, remote *atomic.Value, isclient bool) {
+	buf := make([]byte, 1600)
 	for {
 		n, err := iface.Read(buf)
 		if err != nil {
-			return
+			log.Panic(err)
 		}
-		// log.Printf("read tun %d", n)
+		log.Printf("iface read %d", n)
 
-		binary.Write(w, binary.BigEndian, int16(n))
-		w.Write(buf[:n])
-		err = w.Flush()
-		if err != nil {
-			return
+		s := buf[:n]
+
+		if isclient {
+			_, err = conn.Write(s)
+			if err != nil {
+				log.Print(err)
+			}
+		} else {
+			addr := remote.Load()
+			if addr == nil {
+				continue
+			}
+
+			_, err = conn.WriteTo(s, addr.(net.Addr))
+			if err != nil {
+				log.Print(err)
+			}
 		}
 	}
 }
