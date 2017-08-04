@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/md5"
+	"crypto/rc4"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync/atomic"
 
 	"github.com/coreos/go-iptables/iptables"
@@ -16,11 +19,12 @@ import (
 )
 
 var (
-	localip  = flag.String("l", "10.0.0.1", "local ip")
-	peerip   = flag.String("p", "10.0.0.2", "peer ip")
+	cip      = flag.String("cip", "10.0.0.1", "client tun ip")
+	sip      = flag.String("sip", "10.0.0.2", "server tun ip")
 	addr     = flag.String("addr", ":8000", "remote/listen address")
 	asserver = flag.Bool("s", false, "run as server")
-	iplist   = flag.String("iplist", "", "a file contains ip list to forward")
+	iplist   = flag.String("iplist", "iplist.txt", "a file contains ip list to forward")
+	skey     = flag.String("k", "123456", "secret key")
 )
 
 func system(s string) error {
@@ -33,37 +37,62 @@ func system(s string) error {
 }
 
 func ifconfig(iface string) error {
+	localip := *cip
+	remoteip := *sip
+	if *asserver {
+		localip = *sip
+		remoteip = *cip
+	}
+
 	var cmd string
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = fmt.Sprintf("ifconfig %s %s %s up", iface, *localip, *peerip)
+		cmd = fmt.Sprintf("ifconfig %s %s %s up", iface, localip, remoteip)
 	case "linux":
-		cmd = fmt.Sprintf("ifconfig %s %s netmask 255.255.255.255 pointopoint %s", iface, *localip, *peerip)
+		cmd = fmt.Sprintf("ifconfig %s %s netmask 255.255.255.255 pointopoint %s", iface, localip, remoteip)
 	}
 
 	log.Print(cmd)
 	return system(cmd)
 }
 
-func setupIface() (*water.Interface, error) {
-	iface, err := water.New(water.Config{
-		DeviceType: water.TUN,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	log.Print(iface.Name())
-
-	err = ifconfig(iface.Name())
-	if err != nil {
-		return nil, err
-	}
-
-	return iface, nil
+type Cipher struct {
+	secret []byte
 }
 
-func setupIptables(ifaceName string) error {
+func NewCipher(key string) *Cipher {
+	sum := md5.Sum([]byte(key))
+	return &Cipher{
+		secret: sum[:],
+	}
+}
+
+func (c *Cipher) initCipher() *rc4.Cipher {
+	cipher, err := rc4.NewCipher(c.secret)
+	if err != nil {
+		panic(err)
+	}
+	return cipher
+}
+
+func (c *Cipher) Encode(b []byte) {
+	cipher := c.initCipher()
+	cipher.XORKeyStream(b, b)
+}
+
+func (c *Cipher) Decode(b []byte) {
+	cipher := c.initCipher()
+	cipher.XORKeyStream(b, b)
+}
+
+type Tun struct {
+	iface  *water.Interface
+	conn   *net.UDPConn
+	remote *net.UDPAddr
+	cipher *Cipher
+}
+
+func (tun *Tun) setupIptables() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
@@ -85,12 +114,16 @@ func setupIptables(ifaceName string) error {
 	t.ClearChain("nat", "GOTUN-MARK")
 
 	// mark packets from iface
-	err = t.AppendUnique("nat", "GOTUN-MARK", "-i", ifaceName, "-j", "MARK", "--set-mark", "12321")
+	err = t.AppendUnique("nat", "GOTUN-MARK", "-i", tun.iface.Name(), "-j", "MARK", "--set-mark", "12321")
 	if err != nil {
 		return err
 	}
 
-	err = t.AppendUnique("nat", "GOTUN-NAT", "-m", "mark", "--mark", "12321", "!", "-d", *localip, "-j", "MASQUERADE")
+	localip := *cip
+	if *asserver {
+		localip = *sip
+	}
+	err = t.AppendUnique("nat", "GOTUN-NAT", "-m", "mark", "--mark", "12321", "!", "-d", localip, "-j", "MASQUERADE")
 	if err != nil {
 		return err
 	}
@@ -106,18 +139,17 @@ func setupIptables(ifaceName string) error {
 	return nil
 }
 
-func addRoute(ip, iface string) error {
+func (t *Tun) addRoute(ip string) error {
 	var cmd string
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = fmt.Sprintf("route add -net %s -interface %s", ip, iface)
+		cmd = fmt.Sprintf("route add -net %s -interface %s", ip, t.iface.Name())
 	}
 
 	return system(cmd)
-
 }
 
-func setupRoute(ifaceName string) error {
+func (t *Tun) setupRoute() error {
 	if *iplist == "" {
 		return nil
 	}
@@ -129,8 +161,8 @@ func setupRoute(ifaceName string) error {
 
 	r := bufio.NewScanner(f)
 	for r.Scan() {
-		ip := r.Text()
-		err = addRoute(ip, ifaceName)
+		ip := strings.TrimSpace(r.Text())
+		err = t.addRoute(ip)
 		if err != nil {
 			return err
 		}
@@ -138,49 +170,71 @@ func setupRoute(ifaceName string) error {
 	return nil
 }
 
-func runserver(iface *water.Interface) {
+func (t *Tun) setupIface() error {
+	var err error
+	t.iface, err = water.New(water.Config{
+		DeviceType: water.TUN,
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Print(t.iface.Name())
+
+	err = ifconfig(t.iface.Name())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (t *Tun) setupCipher() {
+	t.cipher = NewCipher(*skey)
+}
+
+func (t *Tun) runserver() {
 	listenaddr, err := net.ResolveUDPAddr("udp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn, err := net.ListenUDP("udp", listenaddr)
+	t.conn, err = net.ListenUDP("udp", listenaddr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	handleConn(conn, iface, nil)
+	t.remote = &net.UDPAddr{}
+	t.handleConn()
 }
 
-func runclient(iface *water.Interface) {
-	remoteaddr, err := net.ResolveUDPAddr("udp", *addr)
+func (t *Tun) runclient() {
+	var err error
+	t.remote, err = net.ResolveUDPAddr("udp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
-	conn, err := net.DialUDP("udp", nil, remoteaddr)
+	t.conn, err = net.DialUDP("udp", nil, t.remote)
 	if err != nil {
 		log.Fatal(err)
 	}
-	handleConn(conn, iface, remoteaddr)
+	t.handleConn()
 }
 
-func handleConn(conn *net.UDPConn, iface *water.Interface, remoteaddr net.Addr) {
-	var isclient bool
+func (t *Tun) handleConn() {
 	var remote atomic.Value
-	if remoteaddr != nil {
-		isclient = true
-	} else {
-		remoteaddr = &net.UDPAddr{}
-	}
+	var remoteaddr net.Addr = t.remote
 	remote.Store(remoteaddr)
-
-	go loopReadIface(iface, conn, &remote, isclient)
+	go t.loopReadIface(&remote)
 
 	buf := make([]byte, 1600)
 	for {
-		n, addr, err := conn.ReadFrom(buf)
+		n, addr, err := t.conn.ReadFrom(buf)
 		if err != nil {
 			log.Print(err)
 			continue
 		}
+		content := buf[:n]
+		t.setupCipher()
+		t.cipher.Decode(content)
 		log.Printf("conn read %d", n)
 
 		if addr.String() != remoteaddr.String() {
@@ -188,26 +242,28 @@ func handleConn(conn *net.UDPConn, iface *water.Interface, remoteaddr net.Addr) 
 			remoteaddr = addr
 			remote.Store(addr)
 		}
-		_, err = iface.Write(buf[:n])
+		_, err = t.iface.Write(content)
 		if err != nil {
-			log.Panic(err)
+			log.Print(err)
 		}
 	}
 }
 
-func loopReadIface(iface *water.Interface, conn *net.UDPConn, remote *atomic.Value, isclient bool) {
+func (t *Tun) loopReadIface(remote *atomic.Value) {
 	buf := make([]byte, 1600)
 	for {
-		n, err := iface.Read(buf)
+		n, err := t.iface.Read(buf)
 		if err != nil {
 			log.Panic(err)
 		}
 		log.Printf("iface read %d", n)
 
-		s := buf[:n]
+		content := buf[:n]
+		t.setupCipher()
+		t.cipher.Encode(content)
 
-		if isclient {
-			_, err = conn.Write(s)
+		if !*asserver {
+			_, err = t.conn.Write(content)
 			if err != nil {
 				log.Print(err)
 			}
@@ -217,7 +273,7 @@ func loopReadIface(iface *water.Interface, conn *net.UDPConn, remote *atomic.Val
 				continue
 			}
 
-			_, err = conn.WriteTo(s, addr.(net.Addr))
+			_, err = t.conn.WriteTo(content, addr.(net.Addr))
 			if err != nil {
 				log.Print(err)
 			}
@@ -228,22 +284,25 @@ func loopReadIface(iface *water.Interface, conn *net.UDPConn, remote *atomic.Val
 func main() {
 	flag.Parse()
 
-	iface, err := setupIface()
+	var t Tun
+	err := t.setupIface()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	t.setupCipher()
+
 	if *asserver {
-		err = setupIptables(iface.Name())
+		err = t.setupIptables()
 		if err != nil {
 			log.Fatal(err)
 		}
-		runserver(iface)
+		t.runserver()
 	} else {
-		err = setupRoute(iface.Name())
+		err = t.setupRoute()
 		if err != nil {
 			log.Fatal(err)
 		}
-		runclient(iface)
+		t.runclient()
 	}
 }
